@@ -20,6 +20,11 @@ class MergedEventData:
     cluster_id: int
     event_data: list[EventData]
     confidence: float  # within cluster level confidence
+    # Components of the confidence (see events_pairing.confidence); 0 for noise
+    cohesion: float = 0.0
+    separation: float = 0.0
+    corroboration: float = 0.0
+    n_sources: int = 1
 
 
 @dataclass

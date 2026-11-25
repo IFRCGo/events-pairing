@@ -4,6 +4,7 @@ import math
 from enum import Enum
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from events_pairing.models import EventData, MergedEventData
@@ -52,6 +53,17 @@ class Utils:
         return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
     @staticmethod
+    def combine_scores(spatial, temporal, spatial_weight: float, temporal_weight: float):
+        """
+        Weighted geometric mean of spatial and temporal similarity (works on floats and numpy arrays).
+
+        Both components must be high for a high score: a pair that is close in time but far apart
+        (or vice versa) scores 0, unlike a weighted sum which would still link it.
+        """
+        total = spatial_weight + temporal_weight
+        return np.power(spatial, spatial_weight / total) * np.power(temporal, temporal_weight / total)
+
+    @staticmethod
     def load_data(file_path: Path) -> dict:
         """Load the data from the file"""
         with open(file_path, "r", encoding="utf-8") as f:
@@ -79,7 +91,10 @@ class Utils:
             "monty:country_codes",
         ]
         df = df[useful_cols]
-        df["monty:hazard_codes"] = df["monty:hazard_codes"].apply(lambda x: x[1] if len(x) > 1 else x[0])
+        # Code order differs by source; pick the first code that maps to a hazard type
+        df["monty:hazard_codes"] = df["monty:hazard_codes"].apply(
+            lambda codes: next((c for c in codes if Mappings.hazard_mapping(c)), None)
+        )
 
         # Remove fully duplicated rows
         df.drop_duplicates(subset=["id"], keep="first", inplace=True)
@@ -97,6 +112,10 @@ class Utils:
                     {
                         "cluster_id": m.cluster_id,
                         "confidence": m.confidence,
+                        "cohesion": m.cohesion,
+                        "separation": m.separation,
+                        "corroboration": m.corroboration,
+                        "n_sources": m.n_sources,
                         "id": r.id,
                         "source": r.source,
                         "hazard_type": r.hazard_type,
@@ -120,10 +139,14 @@ class Utils:
         df = df[df["hazard_type"].notna() & df["source"].notna()]
 
         # 3. Compute derived columns
-        df["lat"] = ((df["bbox"].str[0] + df["bbox"].str[2]) / 2.0).round(3)
-        df["lon"] = ((df["bbox"].str[1] + df["bbox"].str[3]) / 2.0).round(3)
+        # GeoJSON bbox is [min_lon, min_lat, max_lon, max_lat]
+        df["lon"] = ((df["bbox"].str[0] + df["bbox"].str[2]) / 2.0).round(3)
+        df["lat"] = ((df["bbox"].str[1] + df["bbox"].str[3]) / 2.0).round(3)
 
-        df["start_timestamp"] = pd.to_datetime(df["datetime"], utc=True, format="ISO8601").astype("int64") // 10**9
+        # Convert to unix seconds explicitly: pandas 3 parses to datetime64[us], so a raw int64 cast
+        # divided by 10**9 (assuming ns) would make timestamps 1000x too small
+        df["start_timestamp"] = pd.to_datetime(df["datetime"], utc=True, format="mixed").dt.as_unit("s").astype("int64")
+        logger.debug("postprocess_event_df sample:\n%s", df[["datetime", "start_timestamp"]].head(5))
         return df
 
 
@@ -142,7 +165,20 @@ class Mappings:
             "FF": HazardType.FLOOD.value,
             "VO": HazardType.VOLCANO.value,
         }
-        return mappings.get(hazard_code)
+        if not isinstance(hazard_code, str):
+            return None
+        if hazard_code in mappings:
+            return mappings[hazard_code]
+        # EM-DAT category keys, e.g. "nat-hyd-flo-flo" (PDC has no 2-letter code)
+        prefixes = {
+            "nat-hyd-flo": HazardType.FLOOD.value,
+            "nat-geo-ear-gro": HazardType.EARTHQUAKE.value,
+            "nat-gem-ear-gro": HazardType.EARTHQUAKE.value,  # GLIDE spelling variant
+            "nat-met-sto-tro": HazardType.TROPICAL_CYCLONE.value,
+            "nat-cli-wil": HazardType.WILDFIRE.value,
+            "nat-geo-vol": HazardType.VOLCANO.value,
+        }
+        return next((v for p, v in prefixes.items() if hazard_code.startswith(p)), None)
 
     @staticmethod
     def source_mapping(source: str) -> str | None:
@@ -363,42 +399,42 @@ class ComputeScore:
         spatial, temporal = NormalizedValues.normalized_mappings(
             hazard=HazardType.EARTHQUAKE, km_value=self.km, hrs_value=self.hrs
         )
-        return spatial * spatial_weight + temporal * temporal_weight
+        return Utils.combine_scores(spatial, temporal, spatial_weight, temporal_weight)
 
     def _score_flood(self, spatial_weight: float, temporal_weight: float) -> float:
         """Score Flood event"""
         spatial, temporal = NormalizedValues.normalized_mappings(
             hazard=HazardType.FLOOD, km_value=self.km, hrs_value=self.hrs
         )
-        return spatial * spatial_weight + temporal * temporal_weight
+        return Utils.combine_scores(spatial, temporal, spatial_weight, temporal_weight)
 
     def _score_tropical_cyclone(self, spatial_weight: float, temporal_weight: float) -> float:
         """Score Tropical Cyclone event"""
         spatial, temporal = NormalizedValues.normalized_mappings(
             hazard=HazardType.TROPICAL_CYCLONE, km_value=self.km, hrs_value=self.hrs
         )
-        return spatial * spatial_weight + temporal * temporal_weight
+        return Utils.combine_scores(spatial, temporal, spatial_weight, temporal_weight)
 
     def _score_volcano(self, spatial_weight: float, temporal_weight: float) -> float:
         """Score Volcano event"""
         spatial, temporal = NormalizedValues.normalized_mappings(
             hazard=HazardType.VOLCANO, km_value=self.km, hrs_value=self.hrs
         )
-        return spatial * spatial_weight + temporal * temporal_weight
+        return Utils.combine_scores(spatial, temporal, spatial_weight, temporal_weight)
 
     def _score_drought(self, spatial_weight: float, temporal_weight: float) -> float:
         """Score Drought event"""
         spatial, temporal = NormalizedValues.normalized_mappings(
             hazard=HazardType.DROUGHT, km_value=self.km, hrs_value=self.hrs
         )
-        return spatial * spatial_weight + temporal * temporal_weight
+        return Utils.combine_scores(spatial, temporal, spatial_weight, temporal_weight)
 
     def _score_wildfire(self, spatial_weight: float, temporal_weight: float) -> float:
         """Score Wildfire event"""
         spatial, temporal = NormalizedValues.normalized_mappings(
             hazard=HazardType.WILDFIRE, km_value=self.km, hrs_value=self.hrs
         )
-        return spatial * spatial_weight + temporal * temporal_weight
+        return Utils.combine_scores(spatial, temporal, spatial_weight, temporal_weight)
 
     def compute_distance(self, configs: HazardConfig) -> float:
         """Compute distance between two events"""
@@ -427,7 +463,7 @@ class ComputeScore:
         }
 
         score = mappings.get(self.event1.hazard_type)
-        if not score:
+        if score is None:
             logger.warning(f"Mapping not found for hazard {self.event1.hazard_type}")
             return 1.0  # Return max distance
         return 1.0 - score

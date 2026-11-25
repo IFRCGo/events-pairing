@@ -1,5 +1,4 @@
 import logging
-import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -8,14 +7,13 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import DBSCAN
 
+from events_pairing.confidence import compute_cluster_confidence
 from events_pairing.grid_search import GridSearch
 from events_pairing.models import EventData, MergedEventData
 from events_pairing.paths import DATASETS_DIR, OUTPUTS_DIR
 from events_pairing.plots import plot_clusters
 from events_pairing.utils import ComputeScore, HazardType, Utils
 from events_pairing.validation import GridSearchConfigs, HazardConfig
-
-warnings.filterwarnings("error")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,18 +45,17 @@ class Clusters:
 
     def build_clusters(self) -> list:
         """Run the clustering algorithm"""
-        dist_matrices = self.build_distance_matrix()
+        # Kept on the instance so cluster confidence can be computed from the same distances
+        self.distance_matrix = self.build_distance_matrix()
         db = DBSCAN(
             eps=self.configs.cluster_config.eps, min_samples=self.configs.cluster_config.min_samples, metric=self.METRIC
         )
-        labels = db.fit_predict(dist_matrices)
+        labels = db.fit_predict(self.distance_matrix)
         return list(labels)
 
 
 def run_pipeline(events_df: pd.DataFrame, search_configs):
     """Run the pipeline"""
-    all_events: list[EventData] = []
-
     for hazard, grp_df in events_df.groupby(by="hazard_type"):
         if not grp_df.shape[0]:
             logger.warning(f"Data not found for hazard {hazard.value}. Skipping...")
@@ -87,6 +84,9 @@ def run_pipeline(events_df: pd.DataFrame, search_configs):
         labels = clusters.build_clusters()
 
         unique_labels = set(labels)
+        cluster_confidence = compute_cluster_confidence(
+            D=clusters.distance_matrix, labels=labels, sources=[e.source for e in all_events]
+        )
 
         merged: list[MergedEventData] = []
 
@@ -97,8 +97,18 @@ def run_pipeline(events_df: pd.DataFrame, search_configs):
                 for item in cluster_eventdata:
                     merged.append(MergedEventData(cluster_id=-1, event_data=[item], confidence=0.0))
             else:
-                confidence = 1  # cluster_confidence(cluster_eventdata)
-                merged.append(MergedEventData(cluster_id=label, event_data=cluster_eventdata, confidence=confidence))
+                c = cluster_confidence[int(label)]
+                merged.append(
+                    MergedEventData(
+                        cluster_id=label,
+                        event_data=cluster_eventdata,
+                        confidence=c.confidence,
+                        cohesion=c.cohesion,
+                        separation=c.separation,
+                        corroboration=c.corroboration,
+                        n_sources=c.n_sources,
+                    )
+                )
 
         df_final = Utils.convert_to_df(merged=merged)
         # Saving the file as csv

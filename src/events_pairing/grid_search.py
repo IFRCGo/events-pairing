@@ -19,10 +19,12 @@ logger = logging.getLogger(__name__)
 class GridSearch:
     """Grid Search of the weights and cluster configs"""
 
+    MIN_DISTANCE: float = 1e-3
+
     @staticmethod
     def compute_components(report1: EventData, report2: EventData, hazard: HazardType) -> dict:
         """Return component scores"""
-        km = Utils.haversine_km(report1.lat, report1.lon, report1.lat, report2.lon)
+        km = Utils.haversine_km(report1.lat, report1.lon, report2.lat, report2.lon)
         hrs = abs(report1.start_timestamp - report2.start_timestamp) / 3600
 
         spatial, temporal = NormalizedValues.normalized_mappings(hazard=hazard, km_value=km, hrs_value=hrs)
@@ -67,28 +69,33 @@ class GridSearch:
     @staticmethod
     def distance_matrix_from_weights(comp: np.ndarray, weight: WeightConfig) -> np.ndarray:
         """Build a distance matrix"""
-        w = weight.normalized()
-        w_arr = np.array([w.spatial, w.temporal])
-        scores = comp @ w_arr
+        scores = Utils.combine_scores(comp[..., 0], comp[..., 1], weight.spatial, weight.temporal)
         D = 1.0 - scores
         np.clip(D, 0, 1, out=D)
+        # Distinct events with identical location & time (e.g. GDACS episodes) have D=0, which makes
+        # DBCV's core distance (1/d)^dims infinite -> NaN. Floor them to a tiny positive distance.
+        D[D < GridSearch.MIN_DISTANCE] = GridSearch.MIN_DISTANCE
         np.fill_diagonal(D, 0.0)
         return D
 
     @staticmethod
     def compute_dbcv(D: np.ndarray, labels: np.ndarray, dims: int = 2) -> float:
         """
-        Compute DBCV (Density-Based Clustering Validation) scores
+        Compute DBCV (Density-Based Clustering Validation) scores on clustered points only.
+
+        Noise points are excluded: many events are legitimately reported by a single source, and
+        counting them would cap DBCV regardless of cluster quality. The noise ratio is tracked separately.
         """
         n_clusters = len(set(labels) - {-1})
-        n_non_noise = (labels != -1).sum()
+        mask = labels != -1
+        n_non_noise = mask.sum()
 
         # DBCV requires ≥ 2 clusters and ≥ 2 non-noise points per cluster
         if n_clusters < 2 or n_non_noise < 2 * n_clusters:
             return 0.0
 
         try:
-            score = validity_index(D.astype(np.float64), labels, metric="precomputed", d=dims)
+            score = validity_index(D[np.ix_(mask, mask)].astype(np.float64), labels[mask], metric="precomputed", d=dims)
             if np.isnan(score) or np.isinf(score):
                 return 0.0
             return round(float(np.clip(score, -1.0, 1.0)), 2)
@@ -96,7 +103,7 @@ class GridSearch:
             return 0.0
 
     @staticmethod
-    def run_grid_search(events_df: pd.DataFrame, hazard: HazardType, top_k: int = 10) -> typing.Optional[dict]:
+    def run_grid_search(events_df: pd.DataFrame, hazard: HazardType) -> typing.Optional[dict]:
         """Run grid search"""
         # Filters based on hazard type
         postprocessed_df = events_df[events_df["hazard_type"] == hazard.value]
@@ -128,6 +135,17 @@ class GridSearch:
                 labels = db_clusters.fit_predict(D)
                 try:
                     dbcv_score = GridSearch.compute_dbcv(D, labels)
+                    logger.info(
+                        "%s w=(%.1f, %.1f) eps=%.2f min_samples=%d -> clusters=%d noise=%.0f%% dbcv=%.2f",
+                        hazard.value,
+                        w_cfg.spatial,
+                        w_cfg.temporal,
+                        c_cfg.eps,
+                        c_cfg.min_samples,
+                        len(set(labels) - {-1}),
+                        100 * (labels == -1).mean(),
+                        dbcv_score,
+                    )
                     if dbcv_score >= 0.5:
                         configuration = {
                             "labels": labels,
@@ -137,7 +155,14 @@ class GridSearch:
                         }
                         configurations.append(configuration)
                 except Exception:
-                    pass
+                    logger.debug(
+                        "DBCV failed for eps=%.2f min_samples=%d weight=(%.1f, %.1f)",
+                        c_cfg.eps,
+                        c_cfg.min_samples,
+                        w_cfg.spatial,
+                        w_cfg.temporal,
+                        exc_info=True,
+                    )
 
         if not configurations:
             logger.info(f"Using default configuration for hazard {hazard.value}")
